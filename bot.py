@@ -3,10 +3,8 @@ import cv2
 import json
 import hashlib
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 from datetime import datetime
+
 from skimage.metrics import structural_similarity as ssim
 
 from telegram import Update
@@ -14,35 +12,34 @@ from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    ConversationHandler,
     ContextTypes,
+    ConversationHandler,
     filters
 )
 
 # ================= CONFIG =================
 TOKEN = "8596835385:AAGIvKyUkoL1GWx5zGjpDfuTVP5ms2Rn8nM"
-ORIGINAL, QUESTIONED = range(2)
+
+ORIGINAL, TEST = range(2)
 AUDIT_FILE = "audit_log.json"
 
 # ================= IMAGE PROCESSING =================
-def crop_to_signature(image):
-    _, binary = cv2.threshold(image, 127, 255, cv2.THRESH_BINARY_INV)
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return image
-    x, y, w, h = cv2.boundingRect(np.vstack(contours))
-    pad = 10
-    return image[max(0, y-pad):y+h+pad, max(0, x-pad):x+w+pad]
-
 def preprocess(path):
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if img is None:
         return None
-    img = crop_to_signature(img)
-    img = cv2.resize(img, (300, 300))
+
+    _, binary = cv2.threshold(img, 200, 255, cv2.THRESH_BINARY_INV)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if contours:
+        x, y, w, h = cv2.boundingRect(np.vstack(contours))
+        img = img[y:y+h, x:x+w]
+
+    img = cv2.resize(img, (300, 150))
     return img
 
-# ================= FEATURES =================
+# ================= FEATURE EXTRACTION =================
 def extract_features(img):
     edges = cv2.Canny(img, 50, 150)
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -50,117 +47,107 @@ def extract_features(img):
     ink_density = np.sum(img < 128)
     stroke_count = len(contours)
     edge_strength = np.mean(edges)
-    aspect_ratio = img.shape[0] / img.shape[1]
-
-    dist = cv2.distanceTransform(255-img, cv2.DIST_L2, 5)
-    stroke_variation = np.std(dist)
-    tremor = np.std([cv2.arcLength(c, False) for c in contours]) if contours else 0
+    aspect_ratio = img.shape[1] / img.shape[0]
 
     return np.array([
         ink_density,
         stroke_count,
         edge_strength,
-        aspect_ratio,
-        stroke_variation,
-        tremor
+        aspect_ratio
     ], dtype=np.float32)
 
-# ================= SECURITY =================
-def file_hash(path):
-    with open(path, "rb") as f:
-        return hashlib.sha256(f.read()).hexdigest()
+# ================= SIMILARITY =================
+def ml_similarity(f1, f2):
+    diff = np.abs(f1 - f2)
+    score = 1 / (1 + np.mean(diff))
+    return score * 100
 
-def write_audit(log):
-    data = []
+# ================= AUDIT =================
+def write_audit(data):
+    logs = []
     if os.path.exists(AUDIT_FILE):
         with open(AUDIT_FILE, "r") as f:
-            data = json.load(f)
-    data.append(log)
+            logs = json.load(f)
+
+    logs.append(data)
+
     with open(AUDIT_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+        json.dump(logs, f, indent=4)
 
-# ================= AI EXPLANATION (RULE-BASED) =================
-def explain_result(final_score):
-    if final_score >= 75:
-        return "✅ High structural and pattern similarity detected. Signature is likely genuine."
-    elif final_score >= 60:
-        return "⚠ Moderate similarity. Minor stroke or size variations observed."
-    else:
-        return "❌ Low similarity. Stroke pattern, tremor, or structure differs significantly."
-
-# ================= COMPARISON =================
-def compare_signatures(p1, p2, out_img):
-    img1 = preprocess(p1)
-    img2 = preprocess(p2)
-    if img1 is None or img2 is None:
-        return None, None, None
-
-    ssim_score, diff = ssim(img1, img2, full=True)
-    ssim_pct = ssim_score * 100
-
-    f1 = extract_features(img1)
-    f2 = extract_features(img2)
-    ml_sim = max(0, 100 - np.linalg.norm(f1 - f2))
-
-    final = (ssim_pct + ml_sim) / 2
-
-    fig, ax = plt.subplots(1, 3, figsize=(12, 4))
-    ax[0].imshow(img1, cmap="gray"); ax[0].set_title("Original")
-    ax[1].imshow(img2, cmap="gray"); ax[1].set_title("Questioned")
-    ax[2].imshow(diff, cmap="gray"); ax[2].set_title("Difference")
-    for a in ax: a.axis("off")
-    plt.savefig(out_img)
-    plt.close()
-
-    return ssim_pct, ml_sim, final
-
-# ================= BOT HANDLERS =================
+# ================= BOT COMMANDS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "✍ Smart Signature Verification Bot\n\n"
-        "📄 Send ORIGINAL scanned signature"
+        "👋 *Welcome to Signature Verification Bot*\n\n"
+        "📄 Step 1: Send the *ORIGINAL* scanned signature\n"
+        "📄 Step 2: Send the *TEST* scanned signature\n\n"
+        "⚠️ Only SCANNED images are allowed",
+        parse_mode="Markdown"
     )
     return ORIGINAL
 
-async def receive_original(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def original_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo = await update.message.photo[-1].get_file()
-    path = f"orig_{update.effective_user.id}.jpg"
+    path = "original.jpg"
     await photo.download_to_drive(path)
-    context.user_data["orig"] = path
-    await update.message.reply_text("Now send QUESTIONED signature")
-    return QUESTIONED
 
-async def receive_questioned(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["original"] = path
+    await update.message.reply_text("✅ Original signature saved.\n\n➡️ Send TEST signature")
+    return TEST
+
+async def test_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo = await update.message.photo[-1].get_file()
-    qpath = f"ques_{update.effective_user.id}.jpg"
-    await photo.download_to_drive(qpath)
+    test_path = "test.jpg"
+    await photo.download_to_drive(test_path)
 
-    opath = context.user_data["orig"]
-    out = f"result_{update.effective_user.id}.png"
+    orig_path = context.user_data.get("original")
 
-    ssim_s, ml_s, final = compare_signatures(opath, qpath, out)
-    explanation = explain_result(final)
+    img1 = preprocess(orig_path)
+    img2 = preprocess(test_path)
+
+    if img1 is None or img2 is None:
+        await update.message.reply_text("❌ Image processing failed")
+        return ConversationHandler.END
+
+    ssim_score = ssim(img1, img2) * 100
+    f1 = extract_features(img1)
+    f2 = extract_features(img2)
+    ml_score = ml_similarity(f1, f2)
+
+    final_score = (0.7 * ssim_score) + (0.3 * ml_score)
+
+    if final_score >= 75:
+        result = "MATCH ✅"
+        reason = (
+            "✔ High structural similarity\n"
+            "✔ Writing pattern consistent\n"
+            "✔ Stroke flow stable"
+        )
+    else:
+        result = "MISMATCH ❌"
+        reason = (
+            "✖ Stroke pattern mismatch\n"
+            "✖ Writing pressure differs\n"
+            "✖ Structural variation detected"
+        )
 
     report = (
-        f"🔍 Signature Analysis Report\n\n"
-        f"SSIM Similarity : {ssim_s:.2f}%\n"
-        f"ML Similarity   : {ml_s:.2f}%\n"
-        f"Final Score    : {final:.2f}%\n\n"
-        f"{explanation}"
+        "🔍 *Signature Analysis Report*\n\n"
+        f"SSIM Similarity : `{ssim_score:.2f}%`\n"
+        f"ML Similarity   : `{ml_score:.2f}%`\n"
+        f"Final Score    : `{final_score:.2f}%`\n\n"
+        f"*Result*: {result}\n\n"
+        f"*Reason*\n{reason}"
     )
 
-    await update.message.reply_text(report)
-    await update.message.reply_photo(open(out, "rb"))
+    await update.message.reply_text(report, parse_mode="Markdown")
 
     write_audit({
         "time": str(datetime.now()),
-        "score": final,
-        "hash_original": file_hash(opath),
-        "hash_questioned": file_hash(qpath)
+        "ssim": round(ssim_score, 2),
+        "ml": round(ml_score, 2),
+        "final": round(final_score, 2),
+        "result": result
     })
-
-    for f in [opath, qpath, out]:
-        os.remove(f)
 
     return ConversationHandler.END
 
@@ -171,14 +158,15 @@ def main():
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            ORIGINAL: [MessageHandler(filters.PHOTO, receive_original)],
-            QUESTIONED: [MessageHandler(filters.PHOTO, receive_questioned)],
+            ORIGINAL: [MessageHandler(filters.PHOTO, original_image)],
+            TEST: [MessageHandler(filters.PHOTO, test_image)],
         },
         fallbacks=[]
     )
 
     app.add_handler(conv)
-    print("Bot is running...")
+
+    print("✅ Bot is running...")
     app.run_polling()
 
 if __name__ == "__main__":
